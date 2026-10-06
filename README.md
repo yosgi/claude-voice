@@ -63,6 +63,29 @@ versions of this tool did not speak completion or idle notifications. Run the
 manual voice test above. Check `history` and, for worker errors,
 `~/Library/Application Support/ClaudeVoice/worker.log`.
 
+## Stop or pause speech
+
+Stop the current message and clear queued messages (future alerts still play):
+
+```bash
+python3 "$HOME/Library/Application Support/ClaudeVoice/voice.py" stop
+```
+
+Pause voice alerts until you resume them, including across restarts:
+
+```bash
+python3 "$HOME/Library/Application Support/ClaudeVoice/voice.py" mute
+```
+
+Resume voice alerts:
+
+```bash
+python3 "$HOME/Library/Application Support/ClaudeVoice/voice.py" unmute
+```
+
+These commands affect this Mac's voice alerts. Existing Claude notification
+sounds remain enabled. Alerts received while paused are not replayed on resume.
+
 ## Uninstall
 
 Remove only the hook commands referring to `ClaudeVoice` from

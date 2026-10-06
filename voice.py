@@ -79,6 +79,8 @@ def database(state):
 def enqueue(state, message, fingerprint):
     with database(state) as db:
         db.execute('BEGIN IMMEDIATE')
+        if (state / 'muted').exists():
+            return False
         if db.execute('SELECT 1 FROM alerts WHERE fingerprint=? AND created>?',
                       (fingerprint, time.time() - 60)).fetchone():
             return False
@@ -88,33 +90,76 @@ def enqueue(state, message, fingerprint):
     return True
 
 
+def cancellation(state):
+    marker = state / 'cancel'
+    return marker.read_text() if marker.exists() else ''
+
+
+def control(state, action):
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with database(state) as db:
+        db.execute('BEGIN IMMEDIATE')
+        if action == 'unmute':
+            (state / 'muted').unlink(missing_ok=True)
+            print('Voice alerts resumed.')
+            return
+        if action == 'mute':
+            (state / 'muted').touch()
+        (state / 'cancel').write_text(str(time.time_ns()))
+        db.execute("UPDATE alerts SET status='cancelled' WHERE status='pending'")
+    print('Voice alerts paused.' if action == 'mute' else 'Current speech and queued alerts stopped.')
+
+
+def speak(state, message, generation):
+    if (state / 'muted').exists() or cancellation(state) != generation:
+        return 'cancelled'
+    with subprocess.Popen(['/usr/bin/say', '-v', 'Samantha', message]) as speech:
+        deadline = time.monotonic() + 90
+        while speech.poll() is None:
+            if (state / 'muted').exists() or cancellation(state) != generation or time.monotonic() > deadline:
+                speech.terminate()
+                try:
+                    speech.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    speech.kill()
+                    speech.wait()
+                return 'cancelled'
+            time.sleep(0.1)
+        return 'spoken' if speech.returncode == 0 else 'failed'
+
+
 def work(state):
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     # Every hook starts a worker. Waiting on the lock avoids a lost-wakeup race.
     with (state / 'speech.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        generation = cancellation(state)
         with database(state) as db:
             while True:
+                if (state / 'muted').exists() or cancellation(state) != generation:
+                    break
                 row = db.execute("SELECT id,text FROM alerts WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
                 if row is None:
                     break
                 try:
-                    result = subprocess.run(['/usr/bin/say', '-v', 'Samantha', row[1]], timeout=90, check=False)
-                    status = 'spoken' if result.returncode == 0 else 'failed'
+                    status = speak(state, row[1], generation)
                 except (OSError, subprocess.TimeoutExpired):
                     status = 'failed'
-                db.execute('UPDATE alerts SET status=? WHERE id=?', (status, row[0]))
+                db.execute("UPDATE alerts SET status=? WHERE id=? AND status='pending'", (status, row[0]))
                 db.commit()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['hook', 'worker', 'test', 'history', 'replay'])
+    parser.add_argument('action', choices=['hook', 'worker', 'test', 'history', 'replay', 'stop', 'mute', 'unmute'])
     parser.add_argument('--state', type=Path, default=Path.home() / 'Library/Application Support/ClaudeVoice')
     parser.add_argument('--computer', default=socket.gethostname().split('.')[0])
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     state = args.state.resolve()
+    if args.action in ('stop', 'mute', 'unmute'):
+        control(state, args.action)
+        return
     if args.action == 'worker':
         work(state)
         return
@@ -140,6 +185,10 @@ def main():
         fingerprint = json.dumps([event.get('session_id'), event.get('cwd'), message])
     if args.dry_run:
         print(message)
+        return
+    if (state / 'muted').exists():
+        if args.action != 'hook':
+            print('Voice alerts are paused. Run unmute to resume.')
         return
     enqueue(state, message, fingerprint)
     if args.action in ('test', 'replay'):

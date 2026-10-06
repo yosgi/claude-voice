@@ -35,7 +35,7 @@ class VoiceTests(unittest.TestCase):
     def test_manual_test_waits_for_speech(self):
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(sys, 'argv', ['voice.py', 'test', '--state', folder]), \
-                 patch.object(voice.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as say, \
+                 patch.object(voice, 'speak', return_value='spoken') as say, \
                  patch.object(voice.subprocess, 'Popen') as detached:
                 voice.main()
             say.assert_called_once()
@@ -53,12 +53,43 @@ class VoiceTests(unittest.TestCase):
             for i in range(5):
                 self.assertTrue(voice.enqueue(state, f'alert {i}', str(i)))
             spoken = []
-            with patch.object(voice.subprocess, 'run', side_effect=lambda command, **kw:
-                              (spoken.append(command[-1]) or SimpleNamespace(returncode=0))):
+            with patch.object(voice, 'speak', side_effect=lambda state, message, generation:
+                              (spoken.append(message) or 'spoken')):
                 voice.work(state)
             self.assertEqual(spoken, ['same alert'] + [f'alert {i}' for i in range(5)])
             with voice.database(state) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM alerts WHERE status='spoken'").fetchone()[0], 6)
+
+    def test_mute_stop_and_resume(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            voice.enqueue(state, 'queued', 'first')
+            generation = voice.cancellation(state)
+            voice.control(state, 'mute')
+            self.assertNotEqual(voice.cancellation(state), generation)
+            self.assertFalse(voice.enqueue(state, 'new', 'second'))
+            with voice.database(state) as db:
+                self.assertEqual(db.execute('SELECT status FROM alerts').fetchone()[0], 'cancelled')
+            voice.control(state, 'unmute')
+            self.assertTrue(voice.enqueue(state, 'new', 'second'))
+            voice.control(state, 'stop')
+            self.assertFalse((state / 'muted').exists())
+            self.assertTrue(voice.enqueue(state, 'future', 'third'))
+
+    def test_stop_terminates_only_owned_speech(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            generation = voice.cancellation(state)
+            speech = unittest.mock.MagicMock()
+            speech.__enter__.return_value = speech
+            def poll():
+                voice.control(state, 'stop')
+                return None
+            speech.poll.side_effect = poll
+            with patch.object(voice.subprocess, 'Popen', return_value=speech):
+                self.assertEqual(voice.speak(state, 'message', generation), 'cancelled')
+            speech.terminate.assert_called_once()
+            speech.wait.assert_called_once()
 
     def test_install_preserves_settings_and_is_repeatable(self):
         with tempfile.TemporaryDirectory() as folder:
