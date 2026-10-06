@@ -4,7 +4,7 @@ Hear when Claude Code needs your help, even when you are looking at another scre
 Your Mac speaks a short English message with its name, the project, and what happened.
 Useful when you run Claude on several Macs. Free, local, and no API key needed.
 
-Example: "Mac two. Project website. Session 12345678. Claude needs permission."
+Example: "Mac two. Project website. Claude needs permission."
 
 ## Install on each Mac
 
@@ -43,25 +43,31 @@ python3 "$HOME/Library/Application Support/ClaudeVoice/voice.py" replay
 
 ## Behavior
 
-- Speaks every Claude notification, including completion and waiting for input.
-- Announces finished responses, completed tasks, finished subagents, and session start/end.
-- Announces permission requests, denied permissions, tool failures, and API failures.
+- Speaks short completion, permission, input, and API-stop reminders.
+- Ignores ordinary progress, tool failures, subagent chatter, and session start/end.
+- Uses actual permission notifications, so automatic tool checks do not cause speech.
+- Reads one short status sentence, never long errors or full final responses.
+- Merges equivalent reminders from the same project and session: completion within
+  30 seconds, permission/input/API errors within 5 minutes. Changing error details
+  do not create another alert for the same API error type.
+- Queues at most 20 short alerts and discards alerts older than 5 minutes.
 - Uses the built-in Samantha English voice and the Mac's current audio output.
-- Queues speech on each computer; different Macs may speak simultaneously.
-- Suppresses identical alerts within 60 seconds and retains local history for 30 days.
-- Preserves existing notification sounds and completion hooks.
+- Keeps local history for 30 days, including counts of merged reminders.
+- Preserves existing notification sounds and unrelated Claude hooks.
 
-The project folder and short session ID identify a job. Event messages and final
-responses are shortened for speech. "Finished responding" means a turn ended;
-it does not guarantee the whole task succeeded. It does not read every streamed
-token or announce every successful tool call. It cannot detect an OS crash or a
-process that hangs without emitting an event. Delivery depends on Claude Code
-emitting hooks; test the launch workflow you actually use.
+"Finished responding" means a turn ended; it does not guarantee the whole task
+succeeded. A background task can also end in failure. Permissions and input are
+announced when Claude emits the relevant notification (often after about six
+seconds). Idle nudges after a finished response are ignored. Separate sessions
+can still produce separate reminders; your Mac plays them one at a time.
 
-If you hear only a ding, update and reinstall, then restart Claude Code. Older
-versions of this tool did not speak completion or idle notifications. Run the
-manual voice test above. Check `history` and, for worker errors,
-`~/Library/Application Support/ClaudeVoice/worker.log`.
+Upgrading removes this tool's old verbose hooks and cancels the old speech queue.
+Your paused/unpaused state is preserved: an upgrade never automatically unmutes.
+After updating, restart Claude Code sessions to load the smaller hook list.
+
+If there is no voice, check whether it is paused, run the manual test above, and
+check `history` or `~/Library/Application Support/ClaudeVoice/worker.log` for errors.
+The tool cannot detect an OS crash or a process that hangs without emitting an event.
 
 ## Stop or pause speech
 

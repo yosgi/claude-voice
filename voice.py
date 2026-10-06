@@ -14,79 +14,84 @@ def clean(value, limit=240):
     return ' '.join(str(value or '').split())[:limit]
 
 
-def render(event, computer):
+def category(event):
     kind = event.get('hook_event_name')
     if kind == 'Notification':
-        notification = str(event.get('notification_type') or 'notification')
-        if 'permission' in notification:
-            reason = 'Claude needs permission.'
-        elif notification in ('idle_prompt', 'agent_needs_input', 'elicitation_dialog', 'elicitation_url_dialog'):
-            reason = 'Claude is waiting for your input.'
-        elif notification == 'agent_completed':
-            reason = 'Claude background task completed.'
-        else:
-            reason = 'Claude notification. ' + notification.replace('_', ' ') + '.'
-        detail = clean(event.get('message'))
-    elif kind == 'Stop':
-        reason = 'Claude finished responding.'
-        detail = clean(event.get('last_assistant_message'))
-    elif kind == 'TaskCompleted':
-        reason = 'Claude task completed.'
-        detail = clean(event.get('task_subject') or event.get('task_description'))
-    elif kind == 'SubagentStop':
-        reason = 'Claude subagent finished.'
-        detail = clean(event.get('last_assistant_message'))
-    elif kind == 'PostToolUseFailure':
-        reason = 'Claude tool failed. ' + clean(event.get('tool_name'), 60) + '.'
-        detail = clean(event.get('error'))
-    elif kind == 'PermissionDenied':
-        reason = 'Claude tool permission was denied.'
-        detail = clean(event.get('tool_name'), 60)
-    elif kind == 'PermissionRequest':
-        reason = 'Claude needs permission.'
-        detail = clean(event.get('tool_name'), 60)
-    elif kind == 'Elicitation':
-        reason = 'Claude is waiting for your input.'
-        detail = clean(event.get('message'))
-    elif kind == 'SessionStart':
-        reason = 'Claude session started.'
-        detail = clean(event.get('source'), 60)
-    elif kind == 'SessionEnd':
-        reason = 'Claude session ended.'
-        detail = clean(event.get('reason'), 60)
-    elif kind == 'StopFailure':
-        reason = 'Claude stopped because of ' + clean(event.get('error', 'an API error')).replace('_', ' ') + '.'
-        detail = clean(event.get('error_details') or event.get('last_assistant_message'))
-    else:
+        notification = event.get('notification_type')
+        if notification in ('permission_prompt', 'worker_permission_prompt'):
+            return 'permission', 'Claude needs permission.', 300
+        if notification in ('agent_needs_input', 'elicitation_dialog', 'elicitation_url_dialog',
+                            'quota_auto_resume_stale'):
+            return 'input', 'Claude needs your input.', 300
+        if notification == 'agent_completed':
+            # This event can also represent failure; do not promise success.
+            return 'completion', 'Claude background task ended.', 30
+        if notification == 'quota_auto_resume_disabled':
+            return 'api:usage_limit', 'Claude stopped at a usage limit.', 300
         return None
-    project = clean(Path(event.get('cwd') or '.').name, 60) or 'Unknown project'
-    # Project and short session ID distinguish concurrent jobs without reading transcripts.
-    session = clean(event.get('session_id'), 8)
-    label = f'{computer}. Project {project}.'
-    if session:
-        label += f' Session {session}.'
-    return clean(f'{label} {reason} {detail}', 480)
+    if kind == 'Stop':
+        if event.get('stop_hook_active'):
+            return None
+        return 'completion', 'Claude finished responding.', 30
+    if kind == 'TaskCompleted':
+        return 'completion', 'Claude task completed.', 30
+    if kind == 'StopFailure':
+        error = str(event.get('error') or 'unknown')
+        reasons = {
+            'rate_limit': 'a rate limit', 'overloaded': 'the API is overloaded',
+            'authentication_failed': 'authentication failed',
+            'billing_error': 'a billing error', 'server_error': 'a server error',
+            'max_output_tokens': 'the output limit was reached',
+        }
+        return 'api:' + error, 'Claude stopped: ' + reasons.get(error, 'an API error') + '.', 300
+    return None
+
+
+def render(event, computer):
+    alert = category(event)
+    if alert is None:
+        return None
+    project = clean(Path(event.get('cwd') or '.').name, 40) or 'Unknown project'
+    # Speak one short status, not raw errors, commands, or full final responses.
+    return f'{clean(computer, 40)}. Project {project}. {alert[1]}'
+
+
+def alert_key(event, computer):
+    alert = category(event)
+    if alert is None:
+        return None
+    # Coalesce equivalent event sources and changing error details per session.
+    return json.dumps([computer, event.get('cwd'), event.get('session_id'), alert[0]])
 
 
 def database(state):
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     db = sqlite3.connect(state / 'alerts.sqlite', timeout=15)
     db.execute('CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY, created REAL, text TEXT, fingerprint TEXT, status TEXT)')
+    db.execute('CREATE TABLE IF NOT EXISTS merged_alerts (alert_id INTEGER PRIMARY KEY, repeats INTEGER NOT NULL)')
     db.commit()
     return db
 
 
-def enqueue(state, message, fingerprint):
+def enqueue(state, message, fingerprint, cooldown=60):
     with database(state) as db:
         db.execute('BEGIN IMMEDIATE')
         if (state / 'muted').exists():
             return False
-        if db.execute('SELECT 1 FROM alerts WHERE fingerprint=? AND created>?',
-                      (fingerprint, time.time() - 60)).fetchone():
+        duplicate = db.execute(
+            "SELECT id FROM alerts WHERE fingerprint=? AND created>? AND status IN ('pending','spoken') ORDER BY id DESC LIMIT 1",
+            (fingerprint, time.time() - cooldown)).fetchone()
+        if duplicate:
+            db.execute('INSERT INTO merged_alerts(alert_id,repeats) VALUES(?,1) '
+                       'ON CONFLICT(alert_id) DO UPDATE SET repeats=repeats+1', (duplicate[0],))
             return False
         db.execute('INSERT INTO alerts(created,text,fingerprint,status) VALUES(?,?,?,?)',
                    (time.time(), message, fingerprint, 'pending'))
+        # Limit backlog and expire stale reminders instead of reading an old flood.
+        db.execute("UPDATE alerts SET status='cancelled' WHERE status='pending' AND created<?", (time.time()-300,))
+        db.execute("UPDATE alerts SET status='cancelled' WHERE status='pending' AND id NOT IN (SELECT id FROM alerts WHERE status='pending' ORDER BY id DESC LIMIT 20)")
         db.execute('DELETE FROM alerts WHERE created<? AND status != ?', (time.time()-30*86400, 'pending'))
+        db.execute('DELETE FROM merged_alerts WHERE alert_id NOT IN (SELECT id FROM alerts)')
     return True
 
 
@@ -138,6 +143,8 @@ def work(state):
             while True:
                 if (state / 'muted').exists() or cancellation(state) != generation:
                     break
+                db.execute("UPDATE alerts SET status='cancelled' WHERE status='pending' AND created<?", (time.time()-300,))
+                db.commit()
                 row = db.execute("SELECT id,text FROM alerts WHERE status='pending' ORDER BY id LIMIT 1").fetchone()
                 if row is None:
                     break
@@ -165,16 +172,18 @@ def main():
         return
     if args.action in ('history', 'replay'):
         with database(state) as db:
-            rows = db.execute('SELECT created,text,status FROM alerts ORDER BY id DESC LIMIT 20').fetchall()
+            rows = db.execute('SELECT a.created,a.text,a.status,COALESCE(m.repeats,0) FROM alerts a LEFT JOIN merged_alerts m ON m.alert_id=a.id ORDER BY a.id DESC LIMIT 20').fetchall()
         if args.action == 'history':
-            for stamp, message, status in reversed(rows):
-                print(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stamp)), status, message)
+            for stamp, message, status, repeats in reversed(rows):
+                print(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stamp)), status, message,
+                      f'({repeats} repeats merged)' if repeats else '')
             return
         if not rows:
             print('No alerts to replay.')
             return
         message = rows[0][1]
         fingerprint = 'replay:' + str(time.time_ns())
+        cooldown = 0
     else:
         event = ({'hook_event_name': 'Notification', 'notification_type': 'permission_prompt',
                   'cwd': 'voice-test', 'message': 'This is a test. English voice alerts are working.'}
@@ -182,7 +191,10 @@ def main():
         message = render(event, clean(args.computer, 60))
         if message is None:
             return
-        fingerprint = json.dumps([event.get('session_id'), event.get('cwd'), message])
+        fingerprint = alert_key(event, args.computer)
+        cooldown = category(event)[2]
+        if args.action == 'test':
+            fingerprint = 'test:' + str(time.time_ns())
     if args.dry_run:
         print(message)
         return
@@ -190,11 +202,11 @@ def main():
         if args.action != 'hook':
             print('Voice alerts are paused. Run unmute to resume.')
         return
-    enqueue(state, message, fingerprint)
+    accepted = enqueue(state, message, fingerprint, cooldown)
     if args.action in ('test', 'replay'):
         # Manual tests stay attached so their completion can be verified.
         work(state)
-    else:
+    elif accepted:
         # Remain fully detached so speech survives non-interactive CLI teardown.
         # Keep diagnostics instead of silently discarding worker failures.
         with (state / 'worker.log').open('a') as log:

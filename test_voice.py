@@ -1,10 +1,11 @@
 import json
+import io
+import time
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -12,25 +13,61 @@ import voice
 
 
 class VoiceTests(unittest.TestCase):
-    def test_all_notifications_are_spoken(self):
+    def test_only_key_notifications_are_spoken(self):
         event = {'hook_event_name': 'Notification', 'notification_type': 'permission_prompt',
-                 'session_id': '123456789', 'cwd': '/project/website', 'message': 'Please approve.'}
-        self.assertIn('Mac one. Project website.', voice.render(event, 'Mac one'))
-        self.assertIn('Session 12345678.', voice.render(event, 'Mac one'))
-        for kind in ['idle_prompt', 'auth_success', 'agent_completed']:
-            self.assertIsNotNone(voice.render(dict(event, notification_type=kind), 'Mac one'))
-        self.assertIn('Claude notification.', voice.render(dict(event, notification_type='future_event'), 'Mac one'))
-        self.assertIn('rate limit', voice.render(dict(event, hook_event_name='StopFailure', error='rate_limit'), 'Mac one'))
+                 'session_id': '123456789', 'cwd': '/project/website', 'message': 'secret details' * 100}
+        message = voice.render(event, 'Mac one')
+        self.assertEqual(message, 'Mac one. Project website. Claude needs permission.')
+        for kind in ['idle_prompt', 'auth_success', 'future_event', 'quota_auto_resume_fired']:
+            self.assertIsNone(voice.render(dict(event, notification_type=kind), 'Mac one'))
+        self.assertIn('needs your input', voice.render(dict(event, notification_type='agent_needs_input'), 'Mac one'))
+        self.assertIn('task ended', voice.render(dict(event, notification_type='agent_completed'), 'Mac one'))
+        error = voice.render(dict(event, hook_event_name='StopFailure', error='rate_limit', error_details='private traceback' * 100), 'Mac one')
+        self.assertIn('rate limit', error)
+        self.assertNotIn('private', error)
 
-    def test_lifecycle_events(self):
-        for kind, phrase in [('Stop', 'finished responding'), ('TaskCompleted', 'task completed'),
-                             ('SubagentStop', 'subagent finished'), ('PostToolUseFailure', 'tool failed'),
-                             ('PermissionRequest', 'needs permission'), ('PermissionDenied', 'permission was denied'),
-                             ('Elicitation', 'waiting for your input'), ('SessionStart', 'session started'),
-                             ('SessionEnd', 'session ended')]:
-            with self.subTest(kind=kind):
-                self.assertIn(phrase, voice.render({'hook_event_name': kind}, 'Mac one'))
-        self.assertIsNone(voice.render({'hook_event_name': 'PreToolUse'}, 'Mac one'))
+    def test_completion_is_short_and_routine_events_are_silent(self):
+        for kind, phrase in [('Stop', 'finished responding'), ('TaskCompleted', 'task completed')]:
+            message = voice.render({'hook_event_name': kind, 'last_assistant_message': 'long result' * 100}, 'Mac one')
+            self.assertIn(phrase, message)
+            self.assertLess(len(message), 150)
+            self.assertNotIn('long result', message)
+        for kind in ['SubagentStop', 'PostToolUseFailure', 'PermissionRequest', 'PermissionDenied',
+                     'Elicitation', 'SessionStart', 'SessionEnd', 'PreToolUse']:
+            self.assertIsNone(voice.render({'hook_event_name': kind}, 'Mac one'))
+        self.assertIsNone(voice.render({'hook_event_name': 'Stop', 'stop_hook_active': True}, 'Mac one'))
+
+    def test_event_storm_is_coalesced_without_extra_workers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            event = {'hook_event_name': 'Notification', 'notification_type': 'permission_prompt',
+                     'cwd': '/project/website', 'session_id': 'one'}
+            with patch.object(voice.subprocess, 'Popen') as worker:
+                for i in range(50):
+                    payload = dict(event, message=f'Changing command {i}')
+                    with patch.object(sys, 'argv', ['voice.py', 'hook', '--state', folder, '--computer', 'Mac one']), \
+                         patch.object(sys, 'stdin', io.StringIO(json.dumps(payload))):
+                        voice.main()
+                worker.assert_called_once()
+            with voice.database(state) as db:
+                self.assertEqual(db.execute('SELECT count(*) FROM alerts').fetchone()[0], 1)
+                self.assertEqual(db.execute('SELECT repeats FROM merged_alerts').fetchone()[0], 49)
+            first = dict(event, hook_event_name='Stop')
+            second = dict(event, hook_event_name='TaskCompleted')
+            self.assertEqual(voice.alert_key(first, 'Mac one'), voice.alert_key(second, 'Mac one'))
+            self.assertNotEqual(voice.alert_key(event, 'Mac one'), voice.alert_key(dict(event, session_id='two'), 'Mac one'))
+
+    def test_backlog_is_bounded_and_stale_alerts_expire(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            for i in range(50):
+                voice.enqueue(state, f'alert {i}', str(i))
+            with voice.database(state) as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM alerts WHERE status='pending'").fetchone()[0], 20)
+                db.execute('UPDATE alerts SET created=?', (time.time()-301,))
+            with patch.object(voice, 'speak') as say:
+                voice.work(state)
+                say.assert_not_called()
 
     def test_manual_test_waits_for_speech(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -97,6 +134,14 @@ class VoiceTests(unittest.TestCase):
             original = {'env': {'EXAMPLE': 'preserved'}, 'hooks': {
                 'Notification': [{'hooks': [{'type': 'command', 'command': 'existing-notification'}]}],
                 'Stop': [{'hooks': [{'type': 'command', 'command': 'existing-stop'}]}]}}
+            destination = (Path(folder) / 'installed').resolve()
+            voice.enqueue(destination, 'old verbose alert', 'old')
+            (destination / 'muted').touch()
+            legacy_command = str(destination / 'voice.py') + ' hook'
+            original['hooks']['PostToolUseFailure'] = [{'hooks': [
+                {'type': 'command', 'command': legacy_command},
+                {'type': 'command', 'command': 'existing-tool-failure'}]}]
+            original['hooks']['PermissionRequest'] = [{'hooks': [{'type': 'command', 'command': legacy_command}]}]
             settings.write_text(json.dumps(original))
             for _ in range(2):
                 subprocess.run([sys.executable, str(Path(__file__).with_name('install.py')),
@@ -107,11 +152,18 @@ class VoiceTests(unittest.TestCase):
             self.assertEqual(installed['hooks']['Stop'][0], original['hooks']['Stop'][0])
             self.assertEqual(len(installed['hooks']['Stop']), 2)
             self.assertEqual(len(installed['hooks']['Notification']), 2)
-            self.assertNotIn('matcher', installed['hooks']['Notification'][-1])
+            self.assertIn('permission_prompt', installed['hooks']['Notification'][-1]['matcher'])
+            self.assertNotIn('idle_prompt', installed['hooks']['Notification'][-1]['matcher'])
             self.assertEqual(len(installed['hooks']['StopFailure']), 1)
-            for kind in ['TaskCompleted', 'SubagentStop', 'PostToolUseFailure', 'PermissionRequest',
+            self.assertEqual(len(installed['hooks']['TaskCompleted']), 1)
+            self.assertEqual(installed['hooks']['PostToolUseFailure'][0]['hooks'][0]['command'], 'existing-tool-failure')
+            self.assertEqual(len(installed['hooks']['PostToolUseFailure'][0]['hooks']), 1)
+            self.assertTrue((destination / 'muted').exists())
+            with voice.database(destination) as db:
+                self.assertEqual(db.execute('SELECT status FROM alerts').fetchone()[0], 'cancelled')
+            for kind in ['SubagentStop', 'PermissionRequest',
                          'PermissionDenied', 'Elicitation', 'SessionStart', 'SessionEnd']:
-                self.assertEqual(len(installed['hooks'][kind]), 1)
+                self.assertNotIn(kind, installed['hooks'])
             self.assertEqual(len(list(Path(folder).glob('settings.json.voice-backup-*'))), 2)
 
 
