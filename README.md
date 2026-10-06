@@ -43,17 +43,25 @@ python3 "$HOME/Library/Application Support/ClaudeVoice/voice.py" replay
 
 ## Behavior
 
-- Speaks permission prompts, requests for input, and API failures that end a turn.
+- Speaks every Claude notification, including completion and waiting for input.
+- Announces finished responses, completed tasks, finished subagents, and session start/end.
+- Announces permission requests, denied permissions, tool failures, and API failures.
 - Uses the built-in Samantha English voice and the Mac's current audio output.
 - Queues speech on each computer; different Macs may speak simultaneously.
 - Suppresses identical alerts within 60 seconds and retains local history for 30 days.
 - Preserves existing notification sounds and completion hooks.
 
-The project folder and short session ID identify a job; no generated task title is
-available. Event messages are shortened for speech. It does not interpret every
-assistant response or detect every hung process, OS crash, or ordinary tool
-failure. Background delivery depends on Claude Code emitting the relevant hook;
-test the launch workflow you actually use.
+The project folder and short session ID identify a job. Event messages and final
+responses are shortened for speech. "Finished responding" means a turn ended;
+it does not guarantee the whole task succeeded. It does not read every streamed
+token or announce every successful tool call. It cannot detect an OS crash or a
+process that hangs without emitting an event. Delivery depends on Claude Code
+emitting hooks; test the launch workflow you actually use.
+
+If you hear only a ding, update and reinstall, then restart Claude Code. Older
+versions of this tool did not speak completion or idle notifications. Run the
+manual voice test above. Check `history` and, for worker errors,
+`~/Library/Application Support/ClaudeVoice/worker.log`.
 
 ## Uninstall
 

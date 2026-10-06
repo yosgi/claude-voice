@@ -3,17 +3,12 @@
 import argparse
 import fcntl
 import json
-import os
 from pathlib import Path
 import socket
 import sqlite3
 import subprocess
 import sys
 import time
-
-ATTENTION = {'permission_prompt', 'worker_permission_prompt', 'agent_needs_input',
-             'elicitation_dialog', 'elicitation_url_dialog'}
-
 
 def clean(value, limit=240):
     return ' '.join(str(value or '').split())[:limit]
@@ -22,12 +17,43 @@ def clean(value, limit=240):
 def render(event, computer):
     kind = event.get('hook_event_name')
     if kind == 'Notification':
-        notification = event.get('notification_type')
-        if notification not in ATTENTION:
-            return None
-        reason = ('Claude needs permission.' if 'permission' in notification
-                  else 'Claude needs your input.')
+        notification = str(event.get('notification_type') or 'notification')
+        if 'permission' in notification:
+            reason = 'Claude needs permission.'
+        elif notification in ('idle_prompt', 'agent_needs_input', 'elicitation_dialog', 'elicitation_url_dialog'):
+            reason = 'Claude is waiting for your input.'
+        elif notification == 'agent_completed':
+            reason = 'Claude background task completed.'
+        else:
+            reason = 'Claude notification. ' + notification.replace('_', ' ') + '.'
         detail = clean(event.get('message'))
+    elif kind == 'Stop':
+        reason = 'Claude finished responding.'
+        detail = clean(event.get('last_assistant_message'))
+    elif kind == 'TaskCompleted':
+        reason = 'Claude task completed.'
+        detail = clean(event.get('task_subject') or event.get('task_description'))
+    elif kind == 'SubagentStop':
+        reason = 'Claude subagent finished.'
+        detail = clean(event.get('last_assistant_message'))
+    elif kind == 'PostToolUseFailure':
+        reason = 'Claude tool failed. ' + clean(event.get('tool_name'), 60) + '.'
+        detail = clean(event.get('error'))
+    elif kind == 'PermissionDenied':
+        reason = 'Claude tool permission was denied.'
+        detail = clean(event.get('tool_name'), 60)
+    elif kind == 'PermissionRequest':
+        reason = 'Claude needs permission.'
+        detail = clean(event.get('tool_name'), 60)
+    elif kind == 'Elicitation':
+        reason = 'Claude is waiting for your input.'
+        detail = clean(event.get('message'))
+    elif kind == 'SessionStart':
+        reason = 'Claude session started.'
+        detail = clean(event.get('source'), 60)
+    elif kind == 'SessionEnd':
+        reason = 'Claude session ended.'
+        detail = clean(event.get('reason'), 60)
     elif kind == 'StopFailure':
         reason = 'Claude stopped because of ' + clean(event.get('error', 'an API error')).replace('_', ' ') + '.'
         detail = clean(event.get('error_details') or event.get('last_assistant_message'))
@@ -63,7 +89,8 @@ def enqueue(state, message, fingerprint):
 
 
 def work(state):
-    # Every enqueuer starts a worker. Waiting on the lock avoids a lost-wakeup race.
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Every hook starts a worker. Waiting on the lock avoids a lost-wakeup race.
     with (state / 'speech.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         with database(state) as db:
@@ -114,10 +141,17 @@ def main():
     if args.dry_run:
         print(message)
         return
-    if enqueue(state, message, fingerprint):
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', '--state', str(state)],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+    enqueue(state, message, fingerprint)
+    if args.action in ('test', 'replay'):
+        # Manual tests stay attached so their completion can be verified.
+        work(state)
+    else:
+        # Remain fully detached so speech survives non-interactive CLI teardown.
+        # Keep diagnostics instead of silently discarding worker failures.
+        with (state / 'worker.log').open('a') as log:
+            subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'worker', '--state', str(state)],
+                             stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True)
 
 
 if __name__ == '__main__':

@@ -12,14 +12,36 @@ import voice
 
 
 class VoiceTests(unittest.TestCase):
-    def test_attention_filter(self):
+    def test_all_notifications_are_spoken(self):
         event = {'hook_event_name': 'Notification', 'notification_type': 'permission_prompt',
                  'session_id': '123456789', 'cwd': '/project/website', 'message': 'Please approve.'}
         self.assertIn('Mac one. Project website.', voice.render(event, 'Mac one'))
         self.assertIn('Session 12345678.', voice.render(event, 'Mac one'))
         for kind in ['idle_prompt', 'auth_success', 'agent_completed']:
-            self.assertIsNone(voice.render(dict(event, notification_type=kind), 'Mac one'))
+            self.assertIsNotNone(voice.render(dict(event, notification_type=kind), 'Mac one'))
+        self.assertIn('Claude notification.', voice.render(dict(event, notification_type='future_event'), 'Mac one'))
         self.assertIn('rate limit', voice.render(dict(event, hook_event_name='StopFailure', error='rate_limit'), 'Mac one'))
+
+    def test_lifecycle_events(self):
+        for kind, phrase in [('Stop', 'finished responding'), ('TaskCompleted', 'task completed'),
+                             ('SubagentStop', 'subagent finished'), ('PostToolUseFailure', 'tool failed'),
+                             ('PermissionRequest', 'needs permission'), ('PermissionDenied', 'permission was denied'),
+                             ('Elicitation', 'waiting for your input'), ('SessionStart', 'session started'),
+                             ('SessionEnd', 'session ended')]:
+            with self.subTest(kind=kind):
+                self.assertIn(phrase, voice.render({'hook_event_name': kind}, 'Mac one'))
+        self.assertIsNone(voice.render({'hook_event_name': 'PreToolUse'}, 'Mac one'))
+
+    def test_manual_test_waits_for_speech(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(sys, 'argv', ['voice.py', 'test', '--state', folder]), \
+                 patch.object(voice.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as say, \
+                 patch.object(voice.subprocess, 'Popen') as detached:
+                voice.main()
+            say.assert_called_once()
+            detached.assert_not_called()
+            with voice.database(Path(folder)) as db:
+                self.assertEqual(db.execute('SELECT status FROM alerts').fetchone()[0], 'spoken')
 
     def test_concurrent_dedup_and_ordered_speech(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -51,9 +73,14 @@ class VoiceTests(unittest.TestCase):
                                 '--destination', str(Path(folder) / 'installed')], check=True, capture_output=True)
             installed = json.loads(settings.read_text())
             self.assertEqual(installed['env'], original['env'])
-            self.assertEqual(installed['hooks']['Stop'], original['hooks']['Stop'])
+            self.assertEqual(installed['hooks']['Stop'][0], original['hooks']['Stop'][0])
+            self.assertEqual(len(installed['hooks']['Stop']), 2)
             self.assertEqual(len(installed['hooks']['Notification']), 2)
+            self.assertNotIn('matcher', installed['hooks']['Notification'][-1])
             self.assertEqual(len(installed['hooks']['StopFailure']), 1)
+            for kind in ['TaskCompleted', 'SubagentStop', 'PostToolUseFailure', 'PermissionRequest',
+                         'PermissionDenied', 'Elicitation', 'SessionStart', 'SessionEnd']:
+                self.assertEqual(len(installed['hooks'][kind]), 1)
             self.assertEqual(len(list(Path(folder).glob('settings.json.voice-backup-*'))), 2)
 
 

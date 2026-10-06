@@ -22,15 +22,15 @@ destination.mkdir(parents=True, exist_ok=True, mode=0o700)
 target = destination/'voice.py'
 shutil.copy2(Path(__file__).with_name('voice.py'), target)
 command = ' '.join(shlex.quote(s) for s in [sys.executable, str(target), 'hook', '--state', str(destination), '--computer', args.computer])
-for event, matcher in [('Notification', 'permission_prompt|worker_permission_prompt|agent_needs_input|elicitation_dialog|elicitation_url_dialog'), ('StopFailure', None)]:
+for event in ['Notification', 'Stop', 'StopFailure', 'TaskCompleted', 'SubagentStop',
+              'PostToolUseFailure', 'PermissionRequest', 'PermissionDenied',
+              'Elicitation', 'SessionStart', 'SessionEnd']:
     entries = data.setdefault('hooks', {}).setdefault(event, [])
     # Replace only this installer's previous handler, including after a computer rename.
     for entry in entries:
         entry['hooks'] = [h for h in entry.get('hooks', []) if str(target) not in h.get('command', '')]
     entries[:] = [entry for entry in entries if entry.get('hooks')]
     entry = {'hooks': [{'type': 'command', 'command': command, 'timeout': 10}]}
-    if matcher:
-        entry['matcher'] = matcher
     entries.append(entry)
 settings.parent.mkdir(parents=True, exist_ok=True)
 backup = None
